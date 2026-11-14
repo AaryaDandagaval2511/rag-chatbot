@@ -308,3 +308,29 @@ class _FakePage:
 def test_page_of_only_non_breaking_spaces_counts_as_empty():
     """A page of invisible spacing is treated like a blank page (and skipped)."""
     assert _extract_page_text(_FakePage("\u00a0\u00a0\u00a0"), 1, "x.pdf") == ""
+
+
+# --------------------------------------------------------------------------------------
+# Module dependencies
+# --------------------------------------------------------------------------------------
+
+
+def test_loading_and_chunking_do_not_import_chromadb():
+    """Regression: loading/chunking PDFs must not require (or slowly load) the vector
+    database. Checked in a fresh interpreter, since this test process has it loaded."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    code = (
+        "import sys; import app.services.ingestor; "
+        "print('chromadb' in sys.modules)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        check=True,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    assert result.stdout.strip() == "False"

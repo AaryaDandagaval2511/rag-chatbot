@@ -1,11 +1,9 @@
-"""PDF ingestion: load a PDF, then split its pages into retrieval-sized chunks.
-
-This module covers the first two stages of the ingestion pipeline:
+"""PDF ingestion: load a PDF, split it into chunks, embed them and store them.
 
     PDF file -> [load_pdf] -> page Documents -> [chunk_documents] -> chunk Documents
-             -> (later) embedding -> ChromaDB
+             -> [index_pdf: IDs + embeddings] -> ChromaDB collection
 
-`load_and_chunk_pdf` runs both stages in one call.
+`load_and_chunk_pdf` runs loading + chunking; `index_pdf` runs the whole pipeline.
 
 We call `pypdf` directly instead of LangChain's `PyPDFLoader`. PyPDFLoader lived in
 `langchain-community`, which was sunset in 2026. It was a thin wrapper anyway: it ran pypdf
@@ -15,16 +13,25 @@ error handling we control.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import unicodedata
 from collections import Counter
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING, Literal
 
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
 from pypdf.errors import PyPdfError
+
+if TYPE_CHECKING:
+    # Type hints only (never imported at runtime), so loading and chunking PDFs doesn't
+    # require or load ChromaDB. index_pdf imports the vector store when it runs.
+    from chromadb.api.models.Collection import Collection
+    from langchain_core.embeddings import Embeddings
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +77,32 @@ class EmptyPDFError(PDFLoadError):
 
 class ScannedPDFError(PDFLoadError):
     """The PDF has pages but no extractable text (likely scanned / image-only)."""
+
+
+class IndexingError(Exception):
+    """Embedding or storing chunks failed in a way that indicates a bug or bad provider."""
+
+
+# --------------------------------------------------------------------------------------
+# Indexing result
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class IndexResult:
+    """What index_pdf did, for logging now and for the API response later.
+
+    status:
+        "indexed": first time this file was stored
+        "updated": stored, replacing an older version or different chunk settings
+        "skipped": identical content and settings were already stored; nothing embedded
+    """
+
+    file_name: str
+    doc_id: str
+    status: Literal["indexed", "updated", "skipped"]
+    chunk_count: int  # chunks this file has in the store after the call
+    chunks_deleted: int = 0  # stale chunks removed (old version / old settings)
 
 
 # --------------------------------------------------------------------------------------
@@ -212,6 +245,111 @@ def load_and_chunk_pdf(
     return chunk_documents(load_pdf(file_path), chunk_size, chunk_overlap)
 
 
+def compute_doc_id(file_path: str | Path) -> str:
+    """A stable ID for a document: the first 16 hex characters of its SHA-256 hash.
+
+    The ID depends only on the file's bytes, not its name or location, so the same file
+    always gets the same ID. 16 hex chars = 64 bits; accidental collisions are
+    practically impossible at this scale.
+    """
+    sha = hashlib.sha256()
+    with Path(file_path).open("rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):  # 1 MB at a time
+            sha.update(block)
+    return sha.hexdigest()[:16]
+
+
+def index_pdf(
+    file_path: str | Path,
+    *,
+    collection: Collection,
+    embeddings: Embeddings,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
+) -> IndexResult:
+    """Load, chunk, embed and store a PDF. Safe to call repeatedly on the same file.
+
+    The collection and embeddings are passed in ("dependency injection"), so tests can
+    use a temporary database and mock embeddings, and production code can use real ones.
+
+    Rules:
+      * Chunk IDs are "{doc_id}-{chunk_index}": the same file always yields the same IDs.
+      * Skip: if exactly these chunk IDs are already stored with the same chunk settings,
+        return without embedding anything (embedding is the expensive step).
+      * Update: otherwise upsert the new chunks FIRST, then delete leftovers stored under
+        the same file name or the same content (older versions, old chunk settings,
+        half-finished earlier runs). Writing before deleting means a failure part-way
+        through never leaves the file with no chunks at all.
+
+    Raises:
+        PDFLoadError subclasses: the file couldn't be loaded (nothing is written).
+        ValueError: invalid chunk settings.
+        IndexingError: the embedding provider returned the wrong number of vectors.
+    """
+    from app.services import vectorstore  # see the TYPE_CHECKING note at the top
+
+    path = Path(file_path)
+    chunks = load_and_chunk_pdf(path, chunk_size, chunk_overlap)  # validates + loads first
+    doc_id = compute_doc_id(path)
+
+    ids = [f"{doc_id}-{chunk.metadata['chunk_index']}" for chunk in chunks]
+    for chunk in chunks:
+        # Stored with every chunk, so we can find and compare them later.
+        chunk.metadata.update(
+            doc_id=doc_id, chunk_size=chunk_size, chunk_overlap=chunk_overlap
+        )
+
+    # Everything already stored for this content OR this file name.
+    same_content = vectorstore.get_chunk_metadata(collection, {"doc_id": doc_id})
+    same_name = vectorstore.get_chunk_metadata(collection, {"file_name": path.name})
+
+    if _is_already_indexed(same_content, ids, chunk_size, chunk_overlap):
+        # Nothing to embed. But if this file NAME previously held different content,
+        # those old chunks are now stale and must still go.
+        deleted = vectorstore.delete_chunks(collection, set(same_name) - set(ids))
+        stored_as = next(iter(same_content.values()))["file_name"]
+        logger.info(
+            "Skipped '%s': identical content already indexed as '%s' (%d chunks); "
+            "%d stale chunk(s) removed.",
+            path.name,
+            stored_as,
+            len(ids),
+            deleted,
+        )
+        return IndexResult(
+            path.name, doc_id, "skipped", chunk_count=len(ids), chunks_deleted=deleted
+        )
+
+    texts = [chunk.page_content for chunk in chunks]
+    vectors = embeddings.embed_documents(texts)
+    if len(vectors) != len(texts):
+        raise IndexingError(
+            f"Embedding provider returned {len(vectors)} vectors for {len(texts)} chunks."
+        )
+
+    vectorstore.upsert_chunks(
+        collection,
+        ids=ids,
+        documents=texts,
+        metadatas=[chunk.metadata for chunk in chunks],
+        embeddings=vectors,
+    )
+
+    stale_ids = (set(same_content) | set(same_name)) - set(ids)
+    deleted = vectorstore.delete_chunks(collection, stale_ids)
+
+    status = "updated" if (same_content or same_name) else "indexed"
+    logger.info(
+        "%s '%s' (doc_id=%s): %d chunk(s) stored, %d stale chunk(s) removed.",
+        status.capitalize(),
+        path.name,
+        doc_id,
+        len(ids),
+        deleted,
+    )
+    return IndexResult(path.name, doc_id, status, chunk_count=len(ids), chunks_deleted=deleted)
+
+
 # --------------------------------------------------------------------------------------
 # Helpers (private: the leading underscore means "not part of this module's API")
 # --------------------------------------------------------------------------------------
@@ -290,6 +428,20 @@ def _document_metadata(reader: PdfReader, path: Path, total_pages: int) -> dict:
     return metadata
 
 
+def _is_already_indexed(
+    stored: dict[str, dict], expected_ids: list[str], chunk_size: int, chunk_overlap: int
+) -> bool:
+    """True only if the store holds exactly the expected chunk IDs, made with the same
+    chunk settings. A partial set (an interrupted earlier run) or different settings
+    means the file must be re-indexed."""
+    if set(stored) != set(expected_ids):
+        return False
+    return all(
+        meta.get("chunk_size") == chunk_size and meta.get("chunk_overlap") == chunk_overlap
+        for meta in stored.values()
+    )
+
+
 def _validate_chunk_params(chunk_size: int, chunk_overlap: int) -> None:
     """Reject bad settings up front with a clear message.
 
@@ -340,7 +492,9 @@ def _normalize_text(text: str) -> str:
 
 
 # --------------------------------------------------------------------------------------
-# Manual check:  cd backend && python -m app.services.ingestor path/to/file.pdf
+# Manual check (from backend/):
+#   python -m app.services.ingestor file.pdf           preview chunks (writes nothing)
+#   python -m app.services.ingestor file.pdf --index   store in the configured vector store
 # --------------------------------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -348,12 +502,34 @@ if __name__ == "__main__":
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
-    if len(sys.argv) != 2:
-        print("Usage: python -m app.services.ingestor <path-to-pdf>")
+    args = sys.argv[1:]
+    if len(args) not in (1, 2) or (len(args) == 2 and args[1] != "--index"):
+        print("Usage: python -m app.services.ingestor <path-to-pdf> [--index]")
         sys.exit(1)
 
+    if len(args) == 2:
+        # Only needed for --index; a plain preview stays free of ChromaDB.
+        from app.config import get_settings
+        from app.services.embeddings import get_embedding_provider
+        from app.services.vectorstore import open_collection
+
+        settings = get_settings()
+        provider = get_embedding_provider(settings)
+        try:
+            result = index_pdf(
+                args[0],
+                collection=open_collection(settings, provider),
+                embeddings=provider.embeddings,
+            )
+        except PDFLoadError as err:
+            print(f"Error ({type(err).__name__}): {err}")
+            sys.exit(1)
+        print(f"\n{result}\nStored in: {settings.chroma_persist_dir}")
+        print(f"Embedding model: {provider.model} (MOCK - lexical, not semantic)")
+        sys.exit(0)
+
     try:
-        chunks = load_and_chunk_pdf(sys.argv[1])
+        chunks = load_and_chunk_pdf(args[0])
     except PDFLoadError as err:
         print(f"Error ({type(err).__name__}): {err}")
         sys.exit(1)

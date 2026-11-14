@@ -1,4 +1,6 @@
 # Runtime dependencies for the backend.
-langchain-core==1.8.0             # Document class (LangChain's universal data container)
+chromadb==1.5.9                   # vector database, used directly (local persistent storage)
+langchain-core==1.8.0             # Document class and Embeddings interface
 langchain-text-splitters==1.1.3   # RecursiveCharacterTextSplitter for chunking
+pydantic-settings==2.16.2         # config.py: settings from environment variables / .env
 pypdf==7.1.0                      # PDF parsing and text extraction
