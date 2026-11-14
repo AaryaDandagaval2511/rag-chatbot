@@ -1,8 +1,11 @@
-"""PDF ingestion: load a PDF and turn each page into a LangChain Document.
+"""PDF ingestion: load a PDF, then split its pages into retrieval-sized chunks.
 
-This is the first stage of the ingestion pipeline:
+This module covers the first two stages of the ingestion pipeline:
 
-    PDF file  ->  [load_pdf]  ->  list[Document]  ->  (later) chunking -> embedding -> ChromaDB
+    PDF file -> [load_pdf] -> page Documents -> [chunk_documents] -> chunk Documents
+             -> (later) embedding -> ChromaDB
+
+`load_and_chunk_pdf` runs both stages in one call.
 
 We call `pypdf` directly instead of LangChain's `PyPDFLoader`. PyPDFLoader lived in
 `langchain-community`, which was sunset in 2026. It was a thin wrapper anyway: it ran pypdf
@@ -13,9 +16,12 @@ error handling we control.
 from __future__ import annotations
 
 import logging
+from collections import Counter
+from collections.abc import Iterable
 from pathlib import Path
 
 from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
 from pypdf.errors import PyPdfError
 
@@ -24,6 +30,22 @@ logger = logging.getLogger(__name__)
 # The PDF spec allows the "%PDF-" header to appear anywhere in the first 1024 bytes.
 _PDF_MAGIC = b"%PDF-"
 _HEADER_SEARCH_BYTES = 1024
+
+# --- Chunking defaults ----------------------------------------------------------------
+# Sizes are in CHARACTERS, not tokens (roughly 4 characters per English token).
+# 1000 characters is about 150-250 words: usually one complete idea. That's big enough to
+# answer a question on its own, but small enough that its embedding stays about one topic.
+DEFAULT_CHUNK_SIZE = 1000
+# 20% overlap: a sentence that falls on a boundary appears whole in at least one chunk.
+DEFAULT_CHUNK_OVERLAP = 200
+
+# Where the splitter is allowed to cut, from most to least preferred. It uses the first
+# separator that keeps chunks under the size limit, and only falls back to the next one
+# for pieces that are still too long.
+#   "\n\n" paragraph break -> ". " sentence end -> "\n" line break -> " " word -> "" any char
+# Sentence ends come BEFORE single newlines on purpose: pypdf puts "\n" at every printed
+# line wrap, usually mid-sentence, so cutting there would split sentences in half.
+_CHUNK_SEPARATORS = ["\n\n", ". ", "\n", " ", ""]
 
 
 # --------------------------------------------------------------------------------------
@@ -121,6 +143,74 @@ def load_pdf(file_path: str | Path) -> list[Document]:
     return documents
 
 
+def chunk_documents(
+    documents: Iterable[Document],
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
+) -> list[Document]:
+    """Split page Documents into smaller, overlapping chunk Documents.
+
+    Each page is split on its own, so a chunk never spans two pages. That keeps the
+    `page` metadata exact, which later citations ("page 7 of report.pdf") depend on.
+
+    Every chunk keeps its page's metadata and gains:
+        chunk_index: position of the chunk within its source file (0, 1, 2, ...)
+        start_index: character offset where the chunk starts within its page's text
+
+    Raises:
+        ValueError: if chunk_size or chunk_overlap is invalid.
+    """
+    _validate_chunk_params(chunk_size, chunk_overlap)
+
+    documents = list(documents)
+    if not documents:
+        logger.warning("chunk_documents() received no documents; returning no chunks.")
+        return []
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        separators=_CHUNK_SEPARATORS,
+        keep_separator="end",  # keep the "." with its sentence, not at the next chunk's start
+        add_start_index=True,  # record each chunk's offset within its page
+        strip_whitespace=True,
+    )
+    # split_documents copies each page's metadata into every chunk it produces, so the
+    # input pages are left untouched.
+    chunks = splitter.split_documents(documents)
+
+    # Number chunks per source file, so chunks from different PDFs each start at 0.
+    next_index: Counter[str] = Counter()
+    for chunk in chunks:
+        source = str(chunk.metadata.get("source", ""))
+        chunk.metadata["chunk_index"] = next_index[source]
+        next_index[source] += 1
+
+    logger.info(
+        "Split %d page(s) into %d chunk(s) (chunk_size=%d, chunk_overlap=%d).",
+        len(documents),
+        len(chunks),
+        chunk_size,
+        chunk_overlap,
+    )
+    return chunks
+
+
+def load_and_chunk_pdf(
+    file_path: str | Path,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
+) -> list[Document]:
+    """Load a PDF and split it into chunks: the full ingestion pipeline so far.
+
+    Raises the same errors as `load_pdf` and `chunk_documents`.
+    """
+    # Check the settings first, so a config mistake fails instantly instead of after
+    # parsing a possibly large PDF.
+    _validate_chunk_params(chunk_size, chunk_overlap)
+    return chunk_documents(load_pdf(file_path), chunk_size, chunk_overlap)
+
+
 # --------------------------------------------------------------------------------------
 # Helpers (private: the leading underscore means "not part of this module's API")
 # --------------------------------------------------------------------------------------
@@ -199,6 +289,28 @@ def _document_metadata(reader: PdfReader, path: Path, total_pages: int) -> dict:
     return metadata
 
 
+def _validate_chunk_params(chunk_size: int, chunk_overlap: int) -> None:
+    """Reject bad settings up front with a clear message.
+
+    These are programming or configuration mistakes, not problems with a PDF, so they
+    raise ValueError rather than PDFLoadError.
+    """
+    # bool is a subclass of int in Python, so exclude it explicitly (chunk_size=True is a bug).
+    for name, value in (("chunk_size", chunk_size), ("chunk_overlap", chunk_overlap)):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"{name} must be an integer, got {value!r}.")
+
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
+    if chunk_overlap < 0:
+        raise ValueError(f"chunk_overlap cannot be negative, got {chunk_overlap}.")
+    # Overlap equal to the size would make every chunk repeat the previous one.
+    if chunk_overlap >= chunk_size:
+        raise ValueError(
+            f"chunk_overlap ({chunk_overlap}) must be smaller than chunk_size ({chunk_size})."
+        )
+
+
 def _extract_page_text(page, page_number: int, file_name: str) -> str:
     """Extract and trim one page's text. A single broken page shouldn't fail the whole PDF."""
     try:
@@ -225,13 +337,16 @@ if __name__ == "__main__":
         sys.exit(1)
 
     try:
-        docs = load_pdf(sys.argv[1])
+        chunks = load_and_chunk_pdf(sys.argv[1])
     except PDFLoadError as err:
         print(f"Error ({type(err).__name__}): {err}")
         sys.exit(1)
 
-    for doc in docs:
-        preview = doc.page_content[:150].replace("\n", " ")
-        print(f"\n--- page {doc.metadata['page']} / {doc.metadata['total_pages']} ---")
-        print(f"metadata: {doc.metadata}")
-        print(f"text:     {preview}{'...' if len(doc.page_content) > 150 else ''}")
+    for chunk in chunks:
+        meta = chunk.metadata
+        preview = chunk.page_content[:120].replace("\n", " ")
+        print(
+            f"\n--- chunk {meta['chunk_index']} | page {meta['page']}/{meta['total_pages']}"
+            f" | start {meta['start_index']} | {len(chunk.page_content)} chars ---"
+        )
+        print(f"text: {preview}{'...' if len(chunk.page_content) > 120 else ''}")

@@ -22,7 +22,7 @@ cd backend && pytest -v
 ## Status
 
 - [x] Step 2: PDF loading and parsing (`backend/app/services/ingestor.py`)
-- [ ] Chunking
+- [x] Step 3: Chunking (`chunk_documents`, `load_and_chunk_pdf` in `ingestor.py`)
 - [ ] Embeddings + ChromaDB
 - [ ] Retrieval
 - [ ] LLM (Ollama + Llama 3)
