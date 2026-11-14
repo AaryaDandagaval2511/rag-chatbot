@@ -16,6 +16,7 @@ error handling we control.
 from __future__ import annotations
 
 import logging
+import unicodedata
 from collections import Counter
 from collections.abc import Iterable
 from pathlib import Path
@@ -80,7 +81,7 @@ def load_pdf(file_path: str | Path) -> list[Document]:
     """Load a PDF and return one Document per page that contains text.
 
     Each Document has:
-        page_content: the page's extracted text (whitespace-trimmed)
+        page_content: the page's extracted text, Unicode-normalized (NFKC) and trimmed
         metadata:     source, file_name, page (1-based), total_pages,
                       plus title/author when the PDF provides them
 
@@ -282,9 +283,9 @@ def _document_metadata(reader: PdfReader, path: Path, total_pages: int) -> dict:
         info = None  # A broken info dictionary shouldn't stop us from reading the text.
     if info:
         if info.title:
-            metadata["title"] = str(info.title).strip()
+            metadata["title"] = _normalize_text(str(info.title)).strip()
         if info.author:
-            metadata["author"] = str(info.author).strip()
+            metadata["author"] = _normalize_text(str(info.author)).strip()
 
     return metadata
 
@@ -320,7 +321,22 @@ def _extract_page_text(page, page_number: int, file_name: str) -> str:
             "Could not extract text from page %d of '%s': %s", page_number, file_name, exc
         )
         return ""
-    return text.strip()
+    return _normalize_text(text).strip()
+
+
+def _normalize_text(text: str) -> str:
+    """Replace "compatibility" characters with their plain equivalents (Unicode NFKC).
+
+    Why: PDFs often store typographic ligatures as single characters, so pypdf returns
+    "deﬁnes" (with one "ﬁ" character, U+FB01) instead of "defines". That text would never
+    match a search for "defines", and it gives slightly different embeddings. NFKC fixes
+    ligatures (ﬁ ﬂ ﬀ ﬃ ﬄ), non-breaking spaces, full-width letters and "…".
+
+    It leaves accented letters (café), curly quotes, dashes and symbols unchanged.
+    Trade-off: superscripts and subscripts become plain digits ("x²" -> "x2"), which is
+    acceptable for question answering over documents.
+    """
+    return unicodedata.normalize("NFKC", text)
 
 
 # --------------------------------------------------------------------------------------

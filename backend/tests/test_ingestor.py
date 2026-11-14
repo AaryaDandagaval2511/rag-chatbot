@@ -16,6 +16,8 @@ from app.services.ingestor import (
     InvalidPDFError,
     PDFLoadError,
     ScannedPDFError,
+    _extract_page_text,
+    _normalize_text,
     load_pdf,
 )
 from tests.pdf_factory import make_pdf
@@ -231,3 +233,78 @@ def test_owner_only_encryption_is_readable(tmp_path):
 def test_all_errors_share_base_class():
     for error in (InvalidPDFError, EmptyPDFError, ScannedPDFError):
         assert issubclass(error, PDFLoadError)
+
+
+# --------------------------------------------------------------------------------------
+# Unicode normalization (ligatures etc.)
+# --------------------------------------------------------------------------------------
+
+
+def make_ligature_pdf(path):
+    """A PDF whose text uses the font's single "fi" ligature glyph, as many real PDFs do.
+
+    Standard Helvetica uses StandardEncoding, where byte 0xAE (octal \\256) is the "fi"
+    glyph, so pypdf extracts it as U+FB01 "ﬁ". We write a 4-character placeholder and
+    swap in the 4-byte escape "\\256", so the stream's /Length stays correct.
+    """
+    pdf = make_pdf(path, ["The report deQQQQnes the ofQQQQce rules"])
+    pdf.write_bytes(pdf.read_bytes().replace(b"QQQQ", b"\\256"))
+    return pdf
+
+
+def test_ligature_pdf_reproduces_the_problem(tmp_path):
+    """Guard for the test itself: raw pypdf output really does contain the ligature."""
+    from pypdf import PdfReader
+
+    raw = PdfReader(make_ligature_pdf(tmp_path / "lig.pdf")).pages[0].extract_text()
+
+    assert "ﬁ" in raw
+
+
+def test_ligatures_are_normalized_in_page_text(tmp_path):
+    docs = load_pdf(make_ligature_pdf(tmp_path / "lig.pdf"))
+
+    assert docs[0].page_content == "The report defines the office rules"
+    assert "ﬁ" not in docs[0].page_content
+
+
+def test_title_metadata_is_normalized(tmp_path):
+    source = make_pdf(tmp_path / "plain.pdf", ["Text"])
+    writer = PdfWriter(clone_from=source)
+    writer.add_metadata({"/Title": "Ofﬁcial Deﬁnitions", "/Author": "Jane Doe"})
+    titled = tmp_path / "titled.pdf"
+    with titled.open("wb") as f:
+        writer.write(f)
+
+    metadata = load_pdf(titled)[0].metadata
+
+    assert metadata["title"] == "Official Definitions"
+    assert metadata["author"] == "Jane Doe"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("ﬁ ﬂ ﬀ ﬃ ﬄ", "fi fl ff ffi ffl"),  # ligatures
+        ("100 km", "100 km"),  # non-breaking space
+        ("ＡＢＣ１２３", "ABC123"),  # full-width characters
+        ("Wait…", "Wait..."),  # ellipsis
+        ("café naïve", "café naïve"),  # accents are kept
+        ("“quoted” — dash → ✓", "“quoted” — dash → ✓"),  # punctuation and symbols kept
+    ],
+)
+def test_normalize_text(raw, expected):
+    assert _normalize_text(raw) == expected
+
+
+class _FakePage:
+    def __init__(self, text):
+        self._text = text
+
+    def extract_text(self):
+        return self._text
+
+
+def test_page_of_only_non_breaking_spaces_counts_as_empty():
+    """A page of invisible spacing is treated like a blank page (and skipped)."""
+    assert _extract_page_text(_FakePage("\u00a0\u00a0\u00a0"), 1, "x.pdf") == ""
