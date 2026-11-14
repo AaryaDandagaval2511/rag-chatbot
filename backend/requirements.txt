@@ -1,0 +1,3 @@
+# Runtime dependencies for the backend.
+langchain-core==1.8.0   # Document class (LangChain's universal data container)
+pypdf==7.1.0            # PDF parsing and text extraction

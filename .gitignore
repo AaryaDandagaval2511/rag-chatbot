@@ -1,0 +1,19 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Secrets — never commit real config
+.env
+
+# Runtime data: uploaded PDFs and the ChromaDB index (keep the folders via .gitkeep)
+data/*
+!data/.gitkeep
+vectorstore/*
+!vectorstore/.gitkeep
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
